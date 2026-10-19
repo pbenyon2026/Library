@@ -929,20 +929,107 @@ function closeScanner() {
   document.body.style.overflow = "";
   render();
 }
+let stream = null, loopOn = false, detector = null, zxMulti = null, scanStarted = 0, lastHint = 0, frameNo = 0;
+const frameCanvas = document.createElement("canvas");
+const frameCtx = frameCanvas.getContext("2d", { willReadFrequently: true });
+async function setupDecoders() {
+  if (!detector && "BarcodeDetector" in window) {
+    try {
+      const have = await BarcodeDetector.getSupportedFormats();
+      const want = ["ean_13", "ean_8", "upc_a", "upc_e"].filter(f => have.includes(f));
+      if (want.includes("ean_13")) detector = new BarcodeDetector({ formats: want });
+    } catch {}
+  }
+  if (!zxMulti && window.ZXing) { zxMulti = new ZXing.MultiFormatReader(); zxMulti.setHints(formatsHints()); }
+}
 async function startCamera() {
   $("#reticle").hidden = false; $("#camOff").classList.remove("show"); $("#photoBarcode").classList.remove("hl");
-  if (!window.ZXing) { cameraUnavailable("The scanner didn’t load. Check your connection, or type the ISBN."); return; }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { cameraUnavailable(); return; }
+  await setupDecoders();
+  if (!detector && !zxMulti) { cameraUnavailable("The scanner didn’t load. Check your connection, or type the ISBN."); return; }
   try {
-    reader = reader || new ZXing.BrowserMultiFormatReader(formatsHints(), 250);
     status("Starting the camera…");
-    await reader.decodeFromConstraints({ audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } } }, $("#video"), (res) => { if (res) onCode(res.getText()); });
-    status("Hold the barcode on the back cover inside the frame.");
+    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } } });
+    if (!$("#scanner").classList.contains("open")) { stopCamera(); return; }
+    const v = $("#video"); v.setAttribute("playsinline", ""); v.muted = true; v.srcObject = stream;
+    await v.play().catch(() => {});
+    const track = stream.getVideoTracks()[0];
+    try {
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      if (caps.focusMode && caps.focusMode.includes("continuous")) await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+    } catch {}
+    status("Hold the barcode inside the frame, about a hand’s length from the camera.");
+    scanStarted = lastHint = Date.now();
+    loopOn = true; scanLoop();
   } catch (e) {
     cameraUnavailable(e && e.name === "NotAllowedError" ? "Camera access was blocked. Take a photo of the barcode instead, or type the ISBN." : null);
   }
 }
-function stopCamera() { try { reader && reader.reset(); } catch {} }
+function stopCamera() {
+  loopOn = false;
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  const v = $("#video"); if (v) v.srcObject = null;
+}
+// The part of the video frame that sits under the on-screen frame, with some margin around it.
+function reticleCrop(v) {
+  const vp = v.getBoundingClientRect(), rt = $("#reticle").getBoundingClientRect();
+  const vw = v.videoWidth, vh = v.videoHeight;
+  const scale = Math.max(vp.width / vw, vp.height / vh); // object-fit: cover
+  const offX = (vp.width - vw * scale) / 2, offY = (vp.height - vh * scale) / 2;
+  const padX = rt.width * 0.15, padY = rt.height * 0.35;
+  let x = (rt.left - vp.left - padX - offX) / scale, y = (rt.top - vp.top - padY - offY) / scale;
+  let w = (rt.width + 2 * padX) / scale, h = (rt.height + 2 * padY) / scale;
+  x = Math.max(0, x); y = Math.max(0, y); w = Math.min(vw - x, w); h = Math.min(vh - y, h);
+  return { x, y, w, h };
+}
+function zxDecode(canvas) {
+  if (!zxMulti) return null;
+  for (const Bin of [ZXing.HybridBinarizer, ZXing.GlobalHistogramBinarizer]) {
+    try {
+      const bmp = new ZXing.BinaryBitmap(new Bin(new ZXing.HTMLCanvasElementLuminanceSource(canvas)));
+      return zxMulti.decode(bmp, formatsHints()).getText();
+    } catch {}
+  }
+  return null;
+}
+const BOOST = "grayscale(1) contrast(2.2)";
+const SCAN_MODES = [{ f: BOOST, s: 1 }, { f: "none", s: 1 }, { f: BOOST, s: 0.8 }, { f: BOOST, s: 1, full: true }];
+function boosted(canvas, scale) {
+  const c = document.createElement("canvas"); c.width = Math.round(canvas.width * scale); c.height = Math.round(canvas.height * scale);
+  const x = c.getContext("2d", { willReadFrequently: true }); x.filter = BOOST; x.drawImage(canvas, 0, 0, c.width, c.height); return c;
+}
+async function decodeFrame(v) {
+  frameNo++;
+  if (detector) {
+    try { const r = await detector.detect(v); if (r && r[0]) return r[0].rawValue; } catch {}
+    if (!zxMulti || frameNo % 3) return null; // native detector does most of the work; ZXing as a backup now and then
+  }
+  // Cycle through ways of reading the frame: boosted contrast copes with blur and dim light,
+  // a smaller copy copes with soft focus, and now and then the whole picture is searched.
+  const m = SCAN_MODES[frameNo % SCAN_MODES.length];
+  const c = m.full ? { x: 0, y: 0, w: v.videoWidth, h: v.videoHeight } : reticleCrop(v);
+  const s = Math.min(m.s, (m.full ? 1280 : 1100) / c.w);
+  frameCanvas.width = Math.round(c.w * s); frameCanvas.height = Math.round(c.h * s);
+  frameCtx.filter = m.f;
+  frameCtx.drawImage(v, c.x, c.y, c.w, c.h, 0, 0, frameCanvas.width, frameCanvas.height);
+  frameCtx.filter = "none";
+  return zxDecode(frameCanvas);
+}
+async function scanLoop() {
+  const v = $("#video");
+  while (loopOn) {
+    await sleep(detector ? 120 : 160);
+    if (!loopOn) break;
+    if (hold || document.querySelector("dialog[open]") || v.readyState < 2 || !v.videoWidth) { lastHint = Date.now(); continue; }
+    let code = null;
+    try { code = await decodeFrame(v); } catch {}
+    if (code) { lastHint = Date.now(); onCode(code); continue; }
+    if (Date.now() - lastHint > 9000) {
+      lastHint = Date.now();
+      status("Having trouble? Move the book a little further away so the bars look sharp, add more light, or use “Photo of barcode”.");
+    }
+  }
+}
 function cameraUnavailable(msg) {
   $("#reticle").hidden = true; $("#camOff").classList.add("show"); $("#photoBarcode").classList.add("hl");
   status(msg || "Take a photo of the barcode, or type the ISBN.");
@@ -1021,10 +1108,8 @@ async function decodePhoto(file) {
       }
       if (window.ZXing) {
         try {
-          const src = new ZXing.HTMLCanvasElementLuminanceSource(cv);
-          const bmp = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(src));
-          const r = new ZXing.MultiFormatReader(); r.setHints(formatsHints());
-          return r.decode(bmp).getText();
+          await setupDecoders();
+          const t = zxDecode(cv) || zxDecode(boosted(cv, 1)) || zxDecode(boosted(cv, 0.8)); if (t) return t;
         } catch {}
       }
     }

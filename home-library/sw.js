@@ -1,5 +1,5 @@
 // Keeps the app working offline once it has been opened. Your catalog itself lives in the browser's IndexedDB, not here.
-const CACHE = "home-library-v1";
+const CACHE = "home-library-v2";
 const FILES = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png"];
 self.addEventListener("install", e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener("activate", e => {
